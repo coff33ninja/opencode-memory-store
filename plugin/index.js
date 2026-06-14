@@ -1,43 +1,132 @@
 import { tool } from "@opencode-ai/plugin/tool";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
 const DATA_DIR = join(homedir(), ".opencode", "memory");
-const DATA_FILE = join(DATA_DIR, "store.json");
+const DB_PATH = join(DATA_DIR, "store.db");
 
-function init() { mkdirSync(DATA_DIR, { recursive: true }); if (!existsSync(DATA_FILE)) writeFileSync(DATA_FILE, "[]", "utf-8"); }
-function read() { try { return JSON.parse(readFileSync(DATA_FILE, "utf-8")); } catch { return []; } }
-function write(d) { writeFileSync(DATA_FILE, JSON.stringify(d, null, 2), "utf-8"); }
+let db = null;
+
+function getDb() {
+  if (db) return db;
+  mkdirSync(DATA_DIR, { recursive: true });
+  const Database = require("better-sqlite3");
+  db = new Database(DB_PATH);
+  db.pragma("journal_mode = WAL");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS entities (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL CHECK(type IN ('memory','project','person','skill','session','config')),
+      name TEXT NOT NULL DEFAULT '',
+      text TEXT NOT NULL DEFAULT '',
+      category TEXT NOT NULL DEFAULT 'general',
+      scope TEXT NOT NULL DEFAULT 'admin:global',
+      importance REAL NOT NULL DEFAULT 0.5,
+      tags TEXT NOT NULL DEFAULT '[]',
+      data TEXT NOT NULL DEFAULT '{}',
+      source TEXT DEFAULT 'manual',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
+      name, text, category, tags,
+      content='entities',
+      content_rowid='rowid'
+    );
+    CREATE TRIGGER IF NOT EXISTS entities_ai AFTER INSERT ON entities BEGIN
+      INSERT INTO entities_fts(rowid, name, text, category, tags)
+      VALUES (new.rowid, new.name, new.text, new.category, new.tags);
+    END;
+    CREATE TRIGGER IF NOT EXISTS entities_ad AFTER DELETE ON entities BEGIN
+      INSERT INTO entities_fts(entities_fts, rowid, name, text, category, tags)
+      VALUES ('delete', old.rowid, old.name, old.text, old.category, old.tags);
+    END;
+    CREATE TRIGGER IF NOT EXISTS entities_au AFTER UPDATE ON entities BEGIN
+      INSERT INTO entities_fts(entities_fts, rowid, name, text, category, tags)
+      VALUES ('delete', old.rowid, old.name, old.text, old.category, old.tags);
+      INSERT INTO entities_fts(rowid, name, text, category, tags)
+      VALUES (new.rowid, new.name, new.text, new.category, new.tags);
+    END
+  `);
+  for (const col of ["type", "scope", "category", "importance"]) {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_entities_${col} ON entities(${col})`);
+  }
+  // Rebuild FTS for existing data if needed
+  try {
+    const hasEntities = db.prepare("SELECT COUNT(*) as c FROM entities").get().c;
+    const hasFts = db.prepare("SELECT COUNT(*) as c FROM entities_fts").get().c;
+    if (hasEntities > 0 && hasFts === 0) {
+      db.exec("INSERT INTO entities_fts(entities_fts) VALUES('rebuild')");
+    }
+  } catch (_) {}
+  return db;
+}
+
 function now() { return new Date().toISOString(); }
 
-const TYPES = ["memory", "project", "person", "skill", "session", "config"];
-
-function match(e, query) {
-  if (!query) return true;
-  const q = query.toLowerCase();
-  return e.name.toLowerCase().includes(q)
-    || e.text.toLowerCase().includes(q)
-    || e.category.toLowerCase().includes(q)
-    || (e.tags || []).some(t => t.toLowerCase().includes(q));
+function jsonCol(col) {
+  try { return JSON.parse(col); } catch { return col === "data" ? {} : []; }
 }
 
-function filterList(data, { type, scope, category }) {
-  let f = data;
-  if (type) f = f.filter(e => e.type === type);
-  if (scope) f = f.filter(e => e.scope === scope);
-  if (category) f = f.filter(e => e.category === category);
-  return f;
+function ftsQuery(text) {
+  if (!text) return "";
+  return text.match(/[-\w]+/g)?.join(" AND ") || "";
 }
 
-const ENTITY_TYPES = tool.schema.enum(TYPES).optional().describe("Entity type filter");
-const ENTITY_TYPE_REQ = tool.schema.enum(TYPES).describe("Entity type");
+function buildRecall(args) {
+  const d = getDb();
+  let useFts = false, sql, params;
+  if (args.query) {
+    const fq = ftsQuery(args.query);
+    if (fq) {
+      useFts = true;
+      sql = ["SELECT e.* FROM entities e JOIN entities_fts fts ON e.rowid = fts.rowid WHERE entities_fts MATCH ?"];
+      params = [fq];
+    }
+  }
+  if (!useFts) {
+    sql = ["SELECT * FROM entities WHERE 1=1"];
+    params = [];
+    if (args.query) {
+      const l = `%${args.query}%`;
+      sql.push("AND (name LIKE ? OR text LIKE ? OR category LIKE ? OR tags LIKE ?)");
+      params.push(l, l, l, l);
+    }
+  }
+  if (args.type) { sql.push(useFts ? "AND e.type = ?" : "AND type = ?"); params.push(args.type); }
+  if (args.scope) { sql.push(useFts ? "AND e.scope = ?" : "AND scope = ?"); params.push(args.scope); }
+  if (args.category) { sql.push(useFts ? "AND e.category = ?" : "AND category = ?"); params.push(args.category); }
+  sql.push(useFts ? "ORDER BY e.importance DESC, e.updated_at DESC" : "ORDER BY importance DESC, updated_at DESC");
+  sql.push("LIMIT ?");
+  params.push(args.limit || 10);
+  try { return d.prepare(sql.join(" ")).all(...params); }
+  catch { return []; }
+}
+
+function formatRows(rows, label) {
+  if (!rows.length) return label ? `No ${label} found.` : "No results found.";
+  const lines = [label ? `Total: ${rows.length} ${label}:\n` : `Found ${rows.length} result(s):\n`];
+  rows.forEach((r, i) => {
+    const n = r.name ? ` [${r.name}]` : "";
+    lines.push(`${i + 1}. (${r.type})${n} ${(r.text || "").substring(0, 120)}`);
+    lines.push(`   Scope: ${r.scope} | Cat: ${r.category} | Imp: ${r.importance}`);
+    const tags = jsonCol(r.tags);
+    if (tags.length) lines.push(`   Tags: ${tags.join(", ")}`);
+    lines.push("");
+  });
+  return lines.join("\n");
+}
+
+const ENTITY_TYPES = tool.schema.enum(["memory", "project", "person", "skill", "session", "config"]);
+const ENTITY_TYPES_OPT = ENTITY_TYPES.optional().describe("Entity type filter");
+const ENTITY_TYPE_REQ = ENTITY_TYPES.describe("Entity type");
 
 const plugin = async () => ({
   tool: {
     memory_store: tool({
-      description: "Store a typed entity (memory/project/person/skill/session/config). Use type-specific tools for convenience.",
+      description: "Store a typed entity (memory/project/person/skill/session/config) into SQLite.",
       args: {
         type: ENTITY_TYPE_REQ,
         name: tool.schema.string().optional().describe("Entity name/title"),
@@ -46,79 +135,55 @@ const plugin = async () => ({
         scope: tool.schema.string().optional().describe("Scope (e.g. 'project:my-app', 'admin:global')"),
         importance: tool.schema.number().min(0).max(1).optional().describe("Importance 0-1"),
         tags: tool.schema.array(tool.schema.string()).optional().describe("Tags array"),
-        data: tool.schema.object({}).optional().describe("Type-specific structured data as JSON object"),
+        data: tool.schema.object({}).optional().describe("Structured data as JSON object"),
       },
-      async execute(args) {
+      execute(args) {
         try {
-          init(); const d = read();
-          const e = {
-            id: randomUUID(), type: args.type, name: args.name || "",
-            text: args.text || "", category: args.category || "general",
-            scope: args.scope || "admin:global", importance: args.importance ?? 0.5,
-            tags: args.tags || [], data: args.data || {},
-            source: "opencode", created_at: now(), updated_at: now(),
-          };
-          d.push(e); write(d);
-          return `Stored ${args.type}: ${e.id}\nName: ${e.name || "(none)"}\nScope: ${e.scope}`;
+          const d = getDb();
+          const id = randomUUID();
+          const ts = now();
+          d.prepare(`INSERT INTO entities (id,type,name,text,category,scope,importance,tags,data,source,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+            id, args.type, args.name || "", args.text || "", args.category || "general",
+            args.scope || "admin:global", args.importance ?? 0.5,
+            JSON.stringify(args.tags || []), JSON.stringify(args.data || {}),
+            "plugin", ts, ts
+          );
+          return `Stored ${args.type}: ${id}\nName: ${args.name || "(none)"}\nScope: ${args.scope || "admin:global"}`;
         } catch (e) { return `Error: ${e.message || String(e)}`; }
       },
     }),
 
     memory_recall: tool({
-      description: "Search across all entity types by keyword. Use --type to filter.",
+      description: "Search across all entity types by keyword (FTS5). Use --type to filter.",
       args: {
-        query: tool.schema.string().describe("Search text (matches name, content, tags)"),
-        type: ENTITY_TYPES,
+        query: tool.schema.string().describe("Search text"),
+        type: ENTITY_TYPES_OPT,
         scope: tool.schema.string().optional().describe("Filter by scope"),
         category: tool.schema.string().optional().describe("Filter by category"),
         limit: tool.schema.number().min(1).max(100).optional().describe("Max results, default 10"),
       },
-      async execute(args) {
-        try {
-          init(); let data = read();
-          if (args.type) data = data.filter(e => e.type === args.type);
-          if (args.scope) data = data.filter(e => e.scope === args.scope);
-          if (args.category) data = data.filter(e => e.category === args.category);
-          data = data.filter(e => match(e, args.query));
-          data.sort((a, b) => b.importance - a.importance || b.updated_at.localeCompare(a.updated_at));
-          data = data.slice(0, args.limit || 10);
-          if (!data.length) return "No results found.";
-          const lines = [`Found ${data.length} result(s):\n`];
-          data.forEach((r, i) => {
-            const n = r.name ? ` [${r.name}]` : "";
-            lines.push(`${i + 1}. (${r.type})${n} ${(r.text || "").substring(0, 120)}`);
-            lines.push(`   Scope: ${r.scope} | Cat: ${r.category} | Imp: ${r.importance}`);
-            if (r.tags && r.tags.length) lines.push(`   Tags: ${r.tags.join(", ")}`);
-            lines.push("");
-          });
-          return lines.join("\n");
-        } catch (e) { return `Error: ${e.message || String(e)}`; }
-      },
+      execute(args) { try { return formatRows(buildRecall(args)); } catch (e) { return `Error: ${e.message || String(e)}`; } },
     }),
 
     memory_list: tool({
       description: "List entities with optional type/scope/category filter.",
       args: {
-        type: ENTITY_TYPES,
+        type: ENTITY_TYPES_OPT,
         scope: tool.schema.string().optional().describe("Filter by scope"),
         category: tool.schema.string().optional().describe("Filter by category"),
         limit: tool.schema.number().min(1).max(100).optional().describe("Max results, default 50"),
       },
-      async execute(args) {
+      execute(args) {
         try {
-          init(); let data = filterList(read(), args);
-          data.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-          data = data.slice(0, args.limit || 50);
-          if (!data.length) return `No ${args.type || "entities"} found.`;
-          const label = args.type || "entities";
-          const lines = [`Total: ${data.length} ${label}:\n`];
-          data.forEach((r, i) => {
-            const preview = (r.text || "").length > 80 ? (r.text || "").substring(0, 80) + "..." : (r.text || "");
-            const n = r.name ? ` [${r.name}]` : "";
-            lines.push(`${i + 1}. (${r.type})${n} ${preview}`);
-            lines.push(`   ID: ${r.id} | Scope: ${r.scope} | Imp: ${r.importance}`);
-          });
-          return lines.join("\n");
+          const d = getDb();
+          const sql = ["SELECT id,type,name,text,scope,category,importance FROM entities WHERE 1=1"];
+          const p = [];
+          if (args.type) { sql.push("AND type = ?"); p.push(args.type); }
+          if (args.scope) { sql.push("AND scope = ?"); p.push(args.scope); }
+          if (args.category) { sql.push("AND category = ?"); p.push(args.category); }
+          sql.push("ORDER BY updated_at DESC LIMIT ?"); p.push(args.limit || 50);
+          return formatRows(d.prepare(sql.join(" ")).all(...p), args.type || "entities");
         } catch (e) { return `Error: ${e.message || String(e)}`; }
       },
     }),
@@ -126,23 +191,16 @@ const plugin = async () => ({
     memory_get: tool({
       description: "Get a single entity by ID with full details.",
       args: { entityId: tool.schema.string().describe("Entity ID") },
-      async execute({ entityId }) {
+      execute({ entityId }) {
         try {
-          init(); const e = read().find(x => x.id === entityId);
-          if (!e) return "Entity not found.";
+          const r = getDb().prepare("SELECT * FROM entities WHERE id = ?").get(entityId);
+          if (!r) return "Entity not found.";
           return [
-            `ID:   ${e.id}`,
-            `Type: ${e.type}`,
-            `Name: ${e.name || "(none)"}`,
-            `Text: ${e.text}`,
-            `Cat:  ${e.category}`,
-            `Scope: ${e.scope}`,
-            `Imp:  ${e.importance}`,
-            `Tags: ${JSON.stringify(e.tags || [])}`,
-            `Data: ${JSON.stringify(e.data || {}, null, 2)}`,
-            `Src:  ${e.source}`,
-            `Created: ${e.created_at}`,
-            `Updated: ${e.updated_at}`,
+            `ID:   ${r.id}`, `Type: ${r.type}`, `Name: ${r.name || "(none)"}`,
+            `Text: ${r.text}`, `Cat:  ${r.category}`, `Scope: ${r.scope}`,
+            `Imp:  ${r.importance}`, `Tags: ${r.tags}`,
+            `Data: ${JSON.stringify(jsonCol(r.data), null, 2)}`,
+            `Src:  ${r.source}`, `Created: ${r.created_at}`, `Updated: ${r.updated_at}`,
           ].join("\n");
         } catch (e) { return `Error: ${e.message || String(e)}`; }
       },
@@ -160,19 +218,20 @@ const plugin = async () => ({
         tags: tool.schema.array(tool.schema.string()).optional(),
         data: tool.schema.object({}).optional(),
       },
-      async execute(args) {
+      execute(args) {
         try {
-          init(); const d = read(); const idx = d.findIndex(x => x.id === args.entityId);
-          if (idx === -1) return "Entity not found.";
-          if (args.name !== undefined) d[idx].name = args.name;
-          if (args.text !== undefined) d[idx].text = args.text;
-          if (args.category !== undefined) d[idx].category = args.category;
-          if (args.importance !== undefined) d[idx].importance = args.importance;
-          if (args.scope !== undefined) d[idx].scope = args.scope;
-          if (args.tags !== undefined) d[idx].tags = args.tags;
-          if (args.data !== undefined) d[idx].data = args.data;
-          d[idx].updated_at = now(); write(d);
-          return "Updated.";
+          const d = getDb(); const sets = []; const p = [];
+          if (args.name !== undefined) { sets.push("name = ?"); p.push(args.name); }
+          if (args.text !== undefined) { sets.push("text = ?"); p.push(args.text); }
+          if (args.category !== undefined) { sets.push("category = ?"); p.push(args.category); }
+          if (args.importance !== undefined) { sets.push("importance = ?"); p.push(args.importance); }
+          if (args.scope !== undefined) { sets.push("scope = ?"); p.push(args.scope); }
+          if (args.tags !== undefined) { sets.push("tags = ?"); p.push(JSON.stringify(args.tags)); }
+          if (args.data !== undefined) { sets.push("data = ?"); p.push(JSON.stringify(args.data)); }
+          if (!sets.length) return "No fields to update.";
+          sets.push("updated_at = ?"); p.push(now()); p.push(args.entityId);
+          const info = d.prepare(`UPDATE entities SET ${sets.join(", ")} WHERE id = ?`).run(...p);
+          return info.changes > 0 ? "Updated." : "Not found.";
         } catch (e) { return `Error: ${e.message || String(e)}`; }
       },
     }),
@@ -183,20 +242,18 @@ const plugin = async () => ({
         entityId: tool.schema.string().optional().describe("Delete specific ID"),
         query: tool.schema.string().optional().describe("Delete matching content"),
         scope: tool.schema.string().optional().describe("Delete all in this scope"),
-        type: ENTITY_TYPES,
+        type: ENTITY_TYPES_OPT,
       },
-      async execute(args) {
+      execute(args) {
         try {
-          if (!args.entityId && !args.query && !args.scope && !args.type) return "Error: provide at least one filter (entityId, query, scope, or type)";
-          init(); const before = read().length;
-          const d = read().filter(e => {
-            if (args.entityId && e.id === args.entityId) return false;
-            if (args.query && match(e, args.query)) return false;
-            if (args.scope && e.scope === args.scope) return false;
-            if (args.type && e.type === args.type) return false;
-            return true;
-          });
-          write(d); return `Deleted ${before - d.length}.`;
+          if (!args.entityId && !args.query && !args.scope && !args.type)
+            return "Error: provide at least one filter (entityId, query, scope, or type)";
+          const d = getDb(); const sql = ["DELETE FROM entities WHERE 1=1"]; const p = [];
+          if (args.entityId) { sql.push("AND id = ?"); p.push(args.entityId); }
+          if (args.query) { const l = `%${args.query}%`; sql.push("AND (name LIKE ? OR text LIKE ?)"); p.push(l, l); }
+          if (args.scope) { sql.push("AND scope = ?"); p.push(args.scope); }
+          if (args.type) { sql.push("AND type = ?"); p.push(args.type); }
+          return `Deleted ${d.prepare(sql.join(" ")).run(...p).changes}.`;
         } catch (e) { return `Error: ${e.message || String(e)}`; }
       },
     }),
@@ -204,35 +261,33 @@ const plugin = async () => ({
     memory_stats: tool({
       description: "Get memory store statistics by type/category/scope.",
       args: {},
-      async execute() {
+      execute() {
         try {
-          init(); const data = read();
-          const total = data.length;
-          const byType = {}, byCat = {}, byScope = {};
-          let oldest = null, newest = null;
-          for (const e of data) {
-            byType[e.type] = (byType[e.type] || 0) + 1;
-            byCat[e.category] = (byCat[e.category] || 0) + 1;
-            byScope[e.scope] = (byScope[e.scope] || 0) + 1;
-            if (!oldest || e.created_at < oldest) oldest = e.created_at;
-            if (!newest || e.updated_at > newest) newest = e.updated_at;
-          }
+          const d = getDb();
+          const total = d.prepare("SELECT COUNT(*) as c FROM entities").get().c;
+          const byType = d.prepare("SELECT type, COUNT(*) as c FROM entities GROUP BY type ORDER BY type").all();
+          const byCat = d.prepare("SELECT category, COUNT(*) as c FROM entities GROUP BY category ORDER BY category").all();
+          const byScope = d.prepare("SELECT scope, COUNT(*) as c FROM entities GROUP BY scope ORDER BY scope").all();
+          const range = d.prepare("SELECT MIN(created_at) as oldest, MAX(updated_at) as newest FROM entities").get();
           return [
-            "Memory Statistics", "=".repeat(17),
-            `Total: ${total}\n`,
-            "By type:", ...Object.entries(byType).map(([k, v]) => `  ${k}: ${v}`),
-            "\nBy category:", ...Object.entries(byCat).map(([k, v]) => `  ${k}: ${v}`),
-            "\nBy scope:", ...Object.entries(byScope).map(([k, v]) => `  ${k}: ${v}`),
-            `\nRange: ${oldest || "N/A"} to ${newest || "N/A"}`,
+            "Memory Statistics", "=".repeat(17), `Total: ${total}\n`,
+            "By type:", ...byType.map(r => `  ${r.type}: ${r.c}`),
+            "\nBy category:", ...byCat.map(r => `  ${r.category}: ${r.c}`),
+            "\nBy scope:", ...byScope.map(r => `  ${r.scope}: ${r.c}`),
+            `\nRange: ${range?.oldest || "N/A"} to ${range?.newest || "N/A"}`,
           ].join("\n");
         } catch (e) { return `Error: ${e.message || String(e)}`; }
       },
     }),
 
     memory_debug: tool({
-      description: "Verify the plugin is loaded.",
+      description: "Verify the plugin is loaded and connected to SQLite.",
       args: {},
-      execute() { return "opencode-memory-store plugin is working!"; },
+      execute() {
+        try {
+          return `opencode-memory-store plugin OK — ${getDb().prepare("SELECT COUNT(*) as c FROM entities").get().c} entities in SQLite`;
+        } catch (e) { return `Error: ${e.message || String(e)}`; }
+      },
     }),
   },
 });

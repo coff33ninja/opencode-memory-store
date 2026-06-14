@@ -1,4 +1,4 @@
-import sqlite3, json, uuid
+import sqlite3, json, uuid, re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,6 +28,25 @@ CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
 CREATE INDEX IF NOT EXISTS idx_entities_scope ON entities(scope);
 CREATE INDEX IF NOT EXISTS idx_entities_category ON entities(category);
 CREATE INDEX IF NOT EXISTS idx_entities_importance ON entities(importance);
+CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
+    name, text, category, tags,
+    content='entities',
+    content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS entities_ai AFTER INSERT ON entities BEGIN
+    INSERT INTO entities_fts(rowid, name, text, category, tags)
+    VALUES (new.rowid, new.name, new.text, new.category, new.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS entities_ad AFTER DELETE ON entities BEGIN
+    INSERT INTO entities_fts(entities_fts, rowid, name, text, category, tags)
+    VALUES ('delete', old.rowid, old.name, old.text, old.category, old.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS entities_au AFTER UPDATE ON entities BEGIN
+    INSERT INTO entities_fts(entities_fts, rowid, name, text, category, tags)
+    VALUES ('delete', old.rowid, old.name, old.text, old.category, old.tags);
+    INSERT INTO entities_fts(rowid, name, text, category, tags)
+    VALUES (new.rowid, new.name, new.text, new.category, new.tags);
+END;
 """
 
 
@@ -41,6 +60,13 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return d
 
 
+def _fts_query(text: str) -> str:
+    tokens = re.findall(r"[-\w]+", text)
+    if not tokens:
+        return ""
+    return " AND ".join(tokens)
+
+
 class MemoryStore:
     def __init__(self, db_path: str):
         self._db_path = db_path
@@ -49,6 +75,13 @@ class MemoryStore:
     def _init_db(self):
         conn = sqlite3.connect(self._db_path)
         conn.executescript(SCHEMA)
+        try:
+            has_entities = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+            has_fts = conn.execute("SELECT COUNT(*) FROM entities_fts").fetchone()[0]
+            if has_entities and has_fts == 0:
+                conn.executescript("INSERT INTO entities_fts(entities_fts) VALUES('rebuild')")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
         conn.close()
 
@@ -89,28 +122,57 @@ class MemoryStore:
                limit: int = 10, min_importance: float = 0.0) -> list[dict]:
         conn = self._connect()
         try:
-            sql = ["SELECT * FROM entities WHERE 1=1"]
-            params = []
+            use_fts = bool(query) and _fts_query(query)
+            if use_fts:
+                sql = [
+                    "SELECT e.* FROM entities e "
+                    "JOIN entities_fts fts ON e.rowid = fts.rowid "
+                    "WHERE entities_fts MATCH ?"
+                ]
+                params = [_fts_query(query)]
+            else:
+                sql = ["SELECT * FROM entities WHERE 1=1"]
+                params = []
+                if query:
+                    like = f"%{query}%"
+                    sql.append("AND (name LIKE ? OR text LIKE ? OR category LIKE ? OR tags LIKE ?)")
+                    params.extend([like, like, like, like])
             if type:
-                sql.append("AND type = ?")
+                sql.append("AND e.type = ?" if use_fts else "AND type = ?")
                 params.append(type)
             if scope:
-                sql.append("AND scope = ?")
+                sql.append("AND e.scope = ?" if use_fts else "AND scope = ?")
                 params.append(scope)
             if category:
-                sql.append("AND category = ?")
+                sql.append("AND e.category = ?" if use_fts else "AND category = ?")
                 params.append(category)
             if min_importance > 0:
-                sql.append("AND importance >= ?")
+                sql.append("AND e.importance >= ?" if use_fts else "AND importance >= ?")
                 params.append(min_importance)
-            if query:
-                like = f"%{query}%"
-                sql.append("AND (name LIKE ? OR text LIKE ? OR category LIKE ? OR tags LIKE ?)")
-                params.extend([like, like, like, like])
-            sql.append("ORDER BY importance DESC, updated_at DESC")
+            sql.append("ORDER BY e.importance DESC, e.updated_at DESC" if use_fts
+                       else "ORDER BY importance DESC, updated_at DESC")
             sql.append("LIMIT ?")
             params.append(limit)
-            return [_row_to_dict(r) for r in conn.execute(" ".join(sql), params).fetchall()]
+            try:
+                rows = conn.execute(" ".join(sql), params).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            if use_fts and not rows:
+                like = f"%{query}%"
+                sql2 = ["SELECT * FROM entities WHERE (name LIKE ? OR text LIKE ? OR category LIKE ? OR tags LIKE ?)"]
+                p2 = [like, like, like, like]
+                if type:
+                    sql2.append("AND type = ?"); p2.append(type)
+                if scope:
+                    sql2.append("AND scope = ?"); p2.append(scope)
+                if category:
+                    sql2.append("AND category = ?"); p2.append(category)
+                if min_importance > 0:
+                    sql2.append("AND importance >= ?"); p2.append(min_importance)
+                sql2.append("ORDER BY importance DESC, updated_at DESC LIMIT ?")
+                p2.append(limit)
+                rows = conn.execute(" ".join(sql2), p2).fetchall()
+            return [_row_to_dict(r) for r in rows]
         finally:
             conn.close()
 

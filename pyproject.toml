@@ -1,11 +1,12 @@
 [project]
 name = "opencode-memory-store"
 version = "0.1.0"
-description = "Async SQL memory store for OpenCode"
+description = "SQLite + FTS5 memory store for OpenCode — persist context across sessions"
 requires-python = ">=3.10"
-dependencies = [
-    "aiosqlite>=0.20.0",
-]
+dependencies = []
+
+[project.scripts]
+opencode-memory-store = "opencode_memory_store.cli:main"
 
 [build-system]
 requires = ["setuptools>=75.0"]

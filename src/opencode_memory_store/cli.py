@@ -1,10 +1,11 @@
 import sys, json, argparse
+from pathlib import Path
 from .store import MemoryStore, get_db_path
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["store", "get", "recall", "list", "update", "forget", "stats"])
+    parser.add_argument("command", choices=["store", "get", "recall", "list", "update", "forget", "stats", "ingest", "import"])
     parser.add_argument("text", nargs="?", default="")
     parser.add_argument("--db-dir")
     parser.add_argument("--type", default=None, choices=["memory", "project", "person", "skill", "session", "config"])
@@ -19,6 +20,8 @@ def main():
     parser.add_argument("--min-importance", type=float, default=0.0)
     parser.add_argument("--entity-id")
     parser.add_argument("--query")
+    parser.add_argument("--path", help="Project path for ingest command")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be stored without writing")
 
     args = parser.parse_args()
     db_path = get_db_path(args.db_dir)
@@ -116,6 +119,138 @@ def main():
         for k, v in sorted(s['by_scope'].items()):
             print(f"  {k}: {v}")
         print(f"\nRange: {s['oldest_timestamp'] or 'N/A'} to {s['newest_timestamp'] or 'N/A'}")
+
+    elif args.command == "ingest":
+        ingest_project(store, args)
+    elif args.command == "import":
+        import_json(store, args)
+
+
+def import_json(store, args):
+    path = args.path or args.text
+    if not path:
+        print("Error: provide a JSON file path"); sys.exit(1)
+    src = Path(path)
+    if not src.is_file():
+        print(f"Error: not a file: {src}"); sys.exit(1)
+    data = json.loads(src.read_text(encoding="utf-8"))
+    data = data if isinstance(data, list) else [data]
+    count = 0
+    for item in data:
+        if not isinstance(item, dict) or "type" not in item:
+            continue
+        item.setdefault("name", "")
+        item.setdefault("text", "")
+        item.setdefault("category", "general")
+        item.setdefault("scope", "admin:global")
+        item.setdefault("importance", 0.5)
+        item.setdefault("tags", [])
+        item.setdefault("data", {})
+        store.store(
+            type=item["type"], name=item["name"], text=item["text"],
+            category=item["category"], scope=item["scope"],
+            importance=item["importance"], tags=item["tags"],
+            data=item["data"], source=item.get("source", "import"),
+        )
+        count += 1
+    print(f"Imported {count} entities from {src.name}")
+
+
+def ingest_project(store, args):
+    path = args.path or args.text
+    if not path:
+        print("Error: provide a project path as argument or --path")
+        sys.exit(1)
+    root = Path(path).resolve()
+    if not root.is_dir():
+        print(f"Error: not a directory: {root}")
+        sys.exit(1)
+
+    dry = args.dry_run
+    project_name = root.name
+    store_type = lambda: None if dry else None  # skip check in dry mode
+
+    print(f"Ingesting project: {project_name} ({root})")
+
+    # Read key files if they exist
+    readme = read_file(root / "README.md")
+    pubspec = read_file(root / "pubspec.yaml")
+    package = read_file(root / "package.json")
+    cargo = read_file(root / "Cargo.toml")
+
+    # Determine project type
+    ptype = "project"
+    if pubspec:
+        ptype = "flutter"
+    elif cargo:
+        ptype = "rust"
+    elif package:
+        ptype = "node"
+    tags = [ptype, "project"]
+
+    desc_lines = []
+    if readme:
+        for line in readme.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                desc_lines.append(stripped)
+    description = " ".join(desc_lines[:5]) if desc_lines else f"Project at {root}"
+
+    if not dry:
+        existing = store.list_entities(type="project")
+        for e in existing:
+            if e["name"] == project_name:
+                store.update(e["id"], text=description, tags=tags,
+                             data={"readme": readme, "path": str(root)})
+                print(f"  Updated project: {project_name}")
+                break
+        else:
+            eid = store.store(type="project", name=project_name, text=description,
+                              category="app", tags=tags,
+                              data={"readme": readme or "", "path": str(root)})
+            print(f"  Stored project: {project_name} ({eid})")
+    else:
+        print(f"  Would store project: {project_name}")
+
+    # Ingest docs
+    docs_dir = root / "docs"
+    if docs_dir.is_dir():
+        for f in sorted(docs_dir.iterdir()):
+            if f.suffix in (".md", ".txt", ".rst"):
+                content = f.read_text(encoding="utf-8")
+                name = f.stem.replace("-", " ").replace("_", " ").title()
+                first_line = content.splitlines()[0].lstrip("# ").strip() if content.strip() else name
+                if not dry:
+                    store.store(type="config" if "arch" in f.stem.lower() or "rout" in f.stem.lower() else "memory",
+                                name=name, text=first_line[:500],
+                                category="docs", tags=[ptype, "docs", f.stem],
+                                data={"path": str(f), "content": content})
+                print(f"  {'Would store' if dry else 'Stored'} doc: {f.name}")
+
+    # Ingest source files
+    for ext, cat in [(".dart", "dart"), (".rs", "rust"), (".py", "python"),
+                     (".ts", "typescript"), (".js", "javascript"), (".go", "go")]:
+        for f in sorted(root.rglob(f"*{ext}")):
+            if "node_modules" in str(f) or ".dart_tool" in str(f) or ".git" in str(f) or "build" in str(f):
+                continue
+            rel = f.relative_to(root)
+            code = f.read_text(encoding="utf-8")
+            first_line = code.splitlines()[0].strip() if code.strip() else ""
+            desc = first_line.lstrip("#// ").strip() if first_line.startswith(("#", "//")) else str(rel)
+            if not dry:
+                store.store(type="memory", name=str(rel), text=desc[:500],
+                            category="code", tags=[ptype, cat],
+                            data={"path": str(rel), "code": code})
+            print(f"  {'Would store' if dry else 'Stored'} {cat}: {rel}")
+
+    print(f"\n{'Dry run' if dry else 'Done'} — use `opencode-memory-store recall <query>` to find context")
+
+
+def read_file(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
 
 
 if __name__ == "__main__":
