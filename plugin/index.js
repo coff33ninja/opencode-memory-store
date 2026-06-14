@@ -125,16 +125,16 @@ const ENTITY_TYPE_REQ = tool.schema.string().describe("Entity type");
 const plugin = async () => ({
   tool: {
     memory_store: tool({
-      description: "Store a typed entity into the SQLite memory store.",
+      description: "Store a memory/fact into long-term storage. Use this AFTER you learn something worth remembering — user preferences, project decisions, gotchas, architecture choices, config hurdles. Always set a scope so memories don't leak between projects.",
       args: {
         type: ENTITY_TYPE_REQ,
-        name: tool.schema.string().optional().describe("Entity name/title"),
-        text: tool.schema.string().describe("Main content/description"),
-        category: tool.schema.string().optional().describe("Category tag"),
-        scope: tool.schema.string().optional().describe("Scope (e.g. 'project:my-app', 'admin:global')"),
-        importance: tool.schema.number().min(0).max(1).optional().describe("Importance 0-1"),
-        tags: tool.schema.array(tool.schema.string()).optional().describe("Tags array"),
-        data: tool.schema.object({}).optional().describe("Structured data as JSON object"),
+        name: tool.schema.string().optional().describe("Short label for this entity"),
+        text: tool.schema.string().describe("The content to remember"),
+        category: tool.schema.string().optional().describe("Grouping category (e.g. architecture, preference, gotcha, config)"),
+        scope: tool.schema.string().optional().describe("Isolation scope: 'global' for universal knowledge, 'project:<name>' for project-specific, 'user:<name>' for per-user. Default: global"),
+        importance: tool.schema.number().min(0).max(1).optional().describe("How critical this is: 0.9+ = essential (API keys, arch decisions), 0.5-0.8 = useful (patterns, preferences), 0.1-0.4 = nice-to-know"),
+        tags: tool.schema.array(tool.schema.string()).optional().describe("Tags for filtering"),
+        data: tool.schema.object({}).optional().describe("Additional structured data as JSON"),
       },
       async execute(args, _ctx) {
         try {
@@ -154,23 +154,23 @@ const plugin = async () => ({
     }),
 
     memory_recall: tool({
-      description: "Search across all entity types by keyword (FTS5). Use --type to filter.",
+      description: "BEFORE answering a user's question, call this to search your memory for relevant context. You have FTS5 full-text search — query for project names, decisions, preferences, or any keyword. Always scope to the active project when applicable. This is how you avoid cold starts.",
       args: {
-        query: tool.schema.string().describe("Search text"),
+        query: tool.schema.string().describe("Search keywords — will match against names, text, categories, and tags"),
         type: ENTITY_TYPES_OPT,
-        scope: tool.schema.string().optional().describe("Filter by scope"),
-        category: tool.schema.string().optional().describe("Filter by category"),
+        scope: tool.schema.string().optional().describe("Scope filter — e.g. 'project:my-app' to only search within a project"),
+        category: tool.schema.string().optional().describe("Category filter"),
         limit: tool.schema.number().min(1).max(100).optional().describe("Max results, default 10"),
       },
       async execute(args, _ctx) { try { return formatRows(buildRecall(args)); } catch (e) { return `Error: ${e.message || String(e)}`; } },
     }),
 
     memory_list: tool({
-      description: "List entities with optional type/scope/category filter.",
+      description: "List stored entities. Use to browse what you know about a scope or category when you're not sure what keywords to search for.",
       args: {
         type: ENTITY_TYPES_OPT,
-        scope: tool.schema.string().optional().describe("Filter by scope"),
-        category: tool.schema.string().optional().describe("Filter by category"),
+        scope: tool.schema.string().optional().describe("Scope filter — e.g. 'project:my-app' to see everything about a project"),
+        category: tool.schema.string().optional().describe("Category filter"),
         limit: tool.schema.number().min(1).max(100).optional().describe("Max results, default 50"),
       },
       async execute(args, _ctx) {
@@ -188,7 +188,7 @@ const plugin = async () => ({
     }),
 
     memory_get: tool({
-      description: "Get a single entity by ID with full details.",
+      description: "Get the full details of a specific entity by its ID. Use this after a recall or list returns a match you want to inspect completely.",
       args: { entityId: tool.schema.string().describe("Entity ID") },
       async execute(args, _ctx) {
         try {
@@ -206,7 +206,7 @@ const plugin = async () => ({
     }),
 
     memory_update: tool({
-      description: "Update fields on an existing entity.",
+      description: "Update an existing entity when a fact changes. Prefer this over storing duplicate entries — it keeps the memory clean and avoids stale data.",
       args: {
         entityId: tool.schema.string().describe("Entity ID to update"),
         name: tool.schema.string().optional(),
@@ -236,7 +236,7 @@ const plugin = async () => ({
     }),
 
     memory_forget: tool({
-      description: "Delete entities by ID, text query, scope, or type.",
+      description: "Delete obsolete or incorrect memories. Use when a stored fact is no longer true or was stored by mistake.",
       args: {
         entityId: tool.schema.string().optional().describe("Delete specific ID"),
         query: tool.schema.string().optional().describe("Delete matching content"),
@@ -280,7 +280,7 @@ const plugin = async () => ({
     }),
 
     memory_debug: tool({
-      description: "Verify the plugin is loaded and connected to SQLite.",
+      description: "Call this on session start to verify the memory store is available. If it fails, the other memory_* tools won't work either.",
       args: {},
       async execute(_args, _ctx) {
         try {
