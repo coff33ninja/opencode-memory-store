@@ -1,7 +1,7 @@
 [project]
 name = "opencode-memory-store"
 version = "0.1.0"
-description = "SQLite + FTS5 memory store for OpenCode — persist context across sessions"
+description = "SQLite + FTS5 memory store — persist structured context across sessions"
 requires-python = ">=3.10"
 dependencies = []
 

@@ -4,7 +4,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const DATA_DIR = join(homedir(), ".opencode", "memory");
+const DATA_DIR = process.env.MEMORY_STORE_DIR || join(homedir(), ".memory-store");
 const DB_PATH = join(DATA_DIR, "store.db");
 
 let db = null;
@@ -18,11 +18,11 @@ function getDb() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS entities (
       id TEXT PRIMARY KEY,
-      type TEXT NOT NULL CHECK(type IN ('memory','project','person','skill','session','config')),
+      type TEXT NOT NULL DEFAULT 'memory',
       name TEXT NOT NULL DEFAULT '',
       text TEXT NOT NULL DEFAULT '',
       category TEXT NOT NULL DEFAULT 'general',
-      scope TEXT NOT NULL DEFAULT 'admin:global',
+      scope TEXT NOT NULL DEFAULT 'global',
       importance REAL NOT NULL DEFAULT 0.5,
       tags TEXT NOT NULL DEFAULT '[]',
       data TEXT NOT NULL DEFAULT '{}',
@@ -119,14 +119,13 @@ function formatRows(rows, label) {
   return lines.join("\n");
 }
 
-const ENTITY_TYPES = tool.schema.enum(["memory", "project", "person", "skill", "session", "config"]);
-const ENTITY_TYPES_OPT = ENTITY_TYPES.optional().describe("Entity type filter");
-const ENTITY_TYPE_REQ = ENTITY_TYPES.describe("Entity type");
+const ENTITY_TYPES_OPT = tool.schema.string().optional().describe("Entity type filter");
+const ENTITY_TYPE_REQ = tool.schema.string().describe("Entity type");
 
 const plugin = async () => ({
   tool: {
     memory_store: tool({
-      description: "Store a typed entity (memory/project/person/skill/session/config) into SQLite.",
+      description: "Store a typed entity into the SQLite memory store.",
       args: {
         type: ENTITY_TYPE_REQ,
         name: tool.schema.string().optional().describe("Entity name/title"),
@@ -145,11 +144,11 @@ const plugin = async () => ({
           d.prepare(`INSERT INTO entities (id,type,name,text,category,scope,importance,tags,data,source,created_at,updated_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
             id, args.type, args.name || "", args.text || "", args.category || "general",
-            args.scope || "admin:global", args.importance ?? 0.5,
+            args.scope || "global", args.importance ?? 0.5,
             JSON.stringify(args.tags || []), JSON.stringify(args.data || {}),
             "plugin", ts, ts
           );
-          return `Stored ${args.type}: ${id}\nName: ${args.name || "(none)"}\nScope: ${args.scope || "admin:global"}`;
+          return `Stored ${args.type}: ${id}\nName: ${args.name || "(none)"}\nScope: ${args.scope || "global"}`;
         } catch (e) { return `Error: ${e.message || String(e)}`; }
       },
     }),

@@ -1,10 +1,12 @@
-import sqlite3, json, uuid, re
+import os, sqlite3, json, uuid, re
 from datetime import datetime, timezone
 from pathlib import Path
 
 
+DEFAULT_DIR = Path(os.environ.get("MEMORY_STORE_DIR") or Path.home() / ".memory-store")
+
 def get_db_path(db_dir: str | None = None) -> str:
-    p = Path(db_dir) if db_dir else Path.home() / ".opencode" / "memory"
+    p = Path(db_dir) if db_dir else DEFAULT_DIR
     p.mkdir(parents=True, exist_ok=True)
     return str(p / "store.db")
 
@@ -12,11 +14,11 @@ def get_db_path(db_dir: str | None = None) -> str:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS entities (
     id TEXT PRIMARY KEY,
-    type TEXT NOT NULL CHECK(type IN ('memory','project','person','skill','session','config')),
+    type TEXT NOT NULL DEFAULT 'memory',
     name TEXT NOT NULL DEFAULT '',
     text TEXT NOT NULL DEFAULT '',
     category TEXT NOT NULL DEFAULT 'general',
-    scope TEXT NOT NULL DEFAULT 'admin:global',
+    scope TEXT NOT NULL DEFAULT 'global',
     importance REAL NOT NULL DEFAULT 0.5,
     tags TEXT NOT NULL DEFAULT '[]',
     data TEXT NOT NULL DEFAULT '{}',
@@ -91,7 +93,7 @@ class MemoryStore:
         return conn
 
     def store(self, *, type: str = "memory", name: str = "", text: str = "",
-              category: str = "general", scope: str = "admin:global",
+              category: str = "general", scope: str = "global",
               importance: float = 0.5, tags: list | None = None,
               data: dict | None = None, source: str = "manual") -> str:
         eid = str(uuid.uuid4())
