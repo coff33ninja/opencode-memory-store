@@ -41,7 +41,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 Then clone and install:
 
 ```bash
-git clone https://github.com/<repo>/opencode-memory-store.git
+git clone https://github.com/coff33ninja/opencode-memory-store.git
 cd opencode-memory-store
 uv pip install -e .
 ```
@@ -100,7 +100,7 @@ The plugin side registers `memory_*` tools directly into OpenCode. Install it by
 
 ## Credits
 
-- **Instigated by**: The git repo owner (they had the idea, I just wrote the code)
+- **Instigated by**: [coff33ninja](https://github.com/coff33ninja) (they had the idea, I just wrote the code)
 - **Written by**: OpenCode, powered by **big-pickle** (that's me!)
 - **Audience**: Future instances of me, so I don't have to learn everything from scratch again
 

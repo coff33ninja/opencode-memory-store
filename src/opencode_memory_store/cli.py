@@ -9,7 +9,7 @@ def main():
     parser.add_argument("--db-dir")
     parser.add_argument("--type", default=None, choices=["memory", "project", "person", "skill", "session", "config"])
     parser.add_argument("--name", default="")
-    parser.add_argument("--category", default="general")
+    parser.add_argument("--category", default=None)
     parser.add_argument("--scope", default="admin:global")
     parser.add_argument("--importance", type=float, default=0.5)
     parser.add_argument("--tags", default=None)
