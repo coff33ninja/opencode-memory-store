@@ -1,9 +1,34 @@
-import os, sqlite3, json, uuid, re
+import os, sqlite3, json, uuid, re, logging
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 DEFAULT_DIR = Path(os.environ.get("MEMORY_STORE_DIR") or Path.home() / ".memory-store")
+LOG_FILE = str(DEFAULT_DIR / "store.log")
+
+_logger = None
+
+def _get_logger():
+    global _logger
+    if _logger:
+        return _logger
+    _logger = logging.getLogger("memory_store")
+    _logger.setLevel(logging.DEBUG)
+    if not _logger.handlers:
+        try:
+            Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+            _logger.addHandler(fh)
+        except Exception:
+            pass
+        sh = logging.StreamHandler()
+        sh.setLevel(logging.WARNING)
+        sh.setFormatter(logging.Formatter("[memory_store] %(levelname)s: %(message)s"))
+        _logger.addHandler(sh)
+    return _logger
+
 
 def get_db_path(db_dir: str | None = None) -> str:
     p = Path(db_dir) if db_dir else DEFAULT_DIR
@@ -72,6 +97,8 @@ def _fts_query(text: str) -> str:
 class MemoryStore:
     def __init__(self, db_path: str):
         self._db_path = db_path
+        self._log = _get_logger()
+        self._log.info("MemoryStore initialized at %s", db_path)
         self._init_db()
 
     def _init_db(self):
@@ -81,9 +108,10 @@ class MemoryStore:
             has_entities = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
             has_fts = conn.execute("SELECT COUNT(*) FROM entities_fts").fetchone()[0]
             if has_entities and has_fts == 0:
+                self._log.info("Rebuilding FTS index for %d existing entities", has_entities)
                 conn.executescript("INSERT INTO entities_fts(entities_fts) VALUES('rebuild')")
-        except sqlite3.OperationalError:
-            pass
+        except sqlite3.OperationalError as e:
+            self._log.debug("FTS rebuild skipped (first init?): %s", e)
         conn.commit()
         conn.close()
 
@@ -107,7 +135,11 @@ class MemoryStore:
                  json.dumps(tags or []), json.dumps(data or {}), source, now, now)
             )
             conn.commit()
+            self._log.info("Stored %s: %s (scope=%s, imp=%.1f)", type, eid[:8], scope, importance)
             return eid
+        except Exception as e:
+            self._log.error("store failed: %s", e, exc_info=True)
+            raise
         finally:
             conn.close()
 
@@ -115,7 +147,14 @@ class MemoryStore:
         conn = self._connect()
         try:
             row = conn.execute("SELECT * FROM entities WHERE id = ?", (entity_id,)).fetchone()
-            return _row_to_dict(row) if row else None
+            if row:
+                self._log.debug("get %s: found", entity_id[:8])
+                return _row_to_dict(row)
+            self._log.debug("get %s: not found", entity_id[:8])
+            return None
+        except Exception as e:
+            self._log.error("get failed: %s", e, exc_info=True)
+            raise
         finally:
             conn.close()
 
@@ -123,6 +162,11 @@ class MemoryStore:
                scope: str | None = None, category: str | None = None,
                limit: int = 10, min_importance: float = 0.0) -> list[dict]:
         conn = self._connect()
+        log_extra = f"q={query!r}" if query else "no-query"
+        if scope:
+            log_extra += f" scope={scope}"
+        if type:
+            log_extra += f" type={type}"
         try:
             use_fts = bool(query) and _fts_query(query)
             if use_fts:
@@ -157,7 +201,8 @@ class MemoryStore:
             params.append(limit)
             try:
                 rows = conn.execute(" ".join(sql), params).fetchall()
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as e:
+                self._log.warning("FTS query failed, falling back to LIKE: %s", e)
                 rows = []
             if use_fts and not rows:
                 like = f"%{query}%"
@@ -174,7 +219,12 @@ class MemoryStore:
                 sql2.append("ORDER BY importance DESC, updated_at DESC LIMIT ?")
                 p2.append(limit)
                 rows = conn.execute(" ".join(sql2), p2).fetchall()
-            return [_row_to_dict(r) for r in rows]
+            result = [_row_to_dict(r) for r in rows]
+            self._log.info("recall (%s): %d results", log_extra, len(result))
+            return result
+        except Exception as e:
+            self._log.error("recall failed (%s): %s", log_extra, e, exc_info=True)
+            return []
         finally:
             conn.close()
 
@@ -197,7 +247,12 @@ class MemoryStore:
             sql.append("ORDER BY updated_at DESC")
             sql.append("LIMIT ?")
             params.append(limit)
-            return [_row_to_dict(r) for r in conn.execute(" ".join(sql), params).fetchall()]
+            rows = conn.execute(" ".join(sql), params).fetchall()
+            self._log.debug("list_entities (%s): %d rows", type or "all", len(rows))
+            return [_row_to_dict(r) for r in rows]
+        except Exception as e:
+            self._log.error("list_entities failed: %s", e, exc_info=True)
+            raise
         finally:
             conn.close()
 
@@ -224,13 +279,19 @@ class MemoryStore:
             if data is not None:
                 sets.append("data = ?"); params.append(json.dumps(data))
             if not sets:
+                self._log.warning("update %s: no fields to update", entity_id[:8])
                 return False
             sets.append("updated_at = ?")
             params.append(datetime.now(timezone.utc).isoformat())
             params.append(entity_id)
             cur = conn.execute(f"UPDATE entities SET {', '.join(sets)} WHERE id = ?", params)
             conn.commit()
-            return cur.rowcount > 0
+            changed = cur.rowcount > 0
+            self._log.info("update %s: %s (%d fields)", entity_id[:8], "changed" if changed else "not found", len(sets) - 1)
+            return changed
+        except Exception as e:
+            self._log.error("update %s failed: %s", entity_id[:8], e, exc_info=True)
+            raise
         finally:
             conn.close()
 
@@ -252,7 +313,16 @@ class MemoryStore:
                 sql.append("AND type = ?"); params.append(type)
             cur = conn.execute(" ".join(sql), params)
             conn.commit()
-            return cur.rowcount
+            n = cur.rowcount
+            log_extra = entity_id[:8] if entity_id else query or scope or type or "all"
+            if n:
+                self._log.info("forget %s: deleted %d", log_extra, n)
+            else:
+                self._log.debug("forget %s: nothing matched", log_extra)
+            return n
+        except Exception as e:
+            self._log.error("forget failed: %s", e, exc_info=True)
+            raise
         finally:
             conn.close()
 
@@ -270,6 +340,7 @@ class MemoryStore:
             for r in conn.execute("SELECT scope, COUNT(*) as cnt FROM entities GROUP BY scope").fetchall():
                 by_scope[r["scope"]] = r["cnt"]
             row = conn.execute("SELECT MIN(created_at) as oldest, MAX(updated_at) as newest FROM entities").fetchone()
+            self._log.info("stats: %d entities across %d types", total, len(by_type))
             return {
                 "total": total,
                 "by_type": by_type,
@@ -278,5 +349,8 @@ class MemoryStore:
                 "oldest_timestamp": row["oldest"] if row else None,
                 "newest_timestamp": row["newest"] if row else None,
             }
+        except Exception as e:
+            self._log.error("stats failed: %s", e, exc_info=True)
+            raise
         finally:
             conn.close()

@@ -22,10 +22,15 @@ def main():
     parser.add_argument("--query")
     parser.add_argument("--path", help="Project path for ingest command")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be stored without writing")
+    parser.add_argument("--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Set logging level")
 
     args = parser.parse_args()
     db_path = get_db_path(args.db_dir)
     store = MemoryStore(db_path)
+    if args.log_level:
+        import logging
+        logging.getLogger("memory_store").setLevel(getattr(logging, args.log_level.upper()))
 
     if args.command == "store":
         tags = json.loads(args.tags) if args.tags else []

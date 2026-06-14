@@ -1,11 +1,21 @@
 import { tool } from "@opencode-ai/plugin/tool";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
 const DATA_DIR = process.env.MEMORY_STORE_DIR || join(homedir(), ".memory-store");
 const DB_PATH = join(DATA_DIR, "store.db");
+const LOG_PATH = join(DATA_DIR, "store.log");
+
+function log(level, msg, extra) {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    const ts = new Date().toISOString().replace("T", " ").slice(0, 19);
+    const line = `[${ts}] [${level}] ${msg}${extra ? " " + JSON.stringify(extra) : ""}\n`;
+    appendFileSync(LOG_PATH, line, "utf-8");
+  } catch (_) {}
+}
 
 let db = null;
 
@@ -155,8 +165,12 @@ const plugin = async () => ({
             JSON.stringify(args.tags || []), JSON.stringify(args.data || {}),
             "plugin", ts, ts
           );
+          log("INFO", `Stored ${args.type}`, { id: id.slice(0, 8), scope: args.scope || "global", importance: args.importance });
           return `Stored ${args.type}: ${id}\nName: ${args.name || "(none)"}\nScope: ${args.scope || "global"}`;
-        } catch (e) { return `Error: ${e.message || String(e)}`; }
+        } catch (e) {
+          log("ERROR", "memory_store failed", { error: e.message });
+          return `Error: ${e.message || String(e)}`;
+        }
       },
     }),
 
@@ -169,7 +183,16 @@ const plugin = async () => ({
         category: tool.schema.string().optional().describe("Category filter"),
         limit: tool.schema.number().min(1).max(100).optional().describe("Max results, default 10"),
       },
-      async execute(args, _ctx) { try { return formatRows(buildRecall(args)); } catch (e) { return `Error: ${e.message || String(e)}`; } },
+      async execute(args, _ctx) {
+        try {
+          const rows = buildRecall(args);
+          log("INFO", `recall${args.scope ? " scope=" + args.scope : ""}${args.type ? " type=" + args.type : ""}`, { query: args.query, results: rows.length });
+          return formatRows(rows);
+        } catch (e) {
+          log("ERROR", "memory_recall failed", { error: e.message, args });
+          return `Error: ${e.message || String(e)}`;
+        }
+      },
     }),
 
     memory_list: tool({
@@ -189,8 +212,13 @@ const plugin = async () => ({
           if (args.scope) { sql.push("AND scope = ?"); p.push(args.scope); }
           if (args.category) { sql.push("AND category = ?"); p.push(args.category); }
           sql.push("ORDER BY updated_at DESC LIMIT ?"); p.push(args.limit || 50);
-          return formatRows(d.prepare(sql.join(" ")).all(...p), args.type || "entities");
-        } catch (e) { return `Error: ${e.message || String(e)}`; }
+          const rows = d.prepare(sql.join(" ")).all(...p);
+          log("INFO", `list_entities`, { type: args.type, scope: args.scope, results: rows.length });
+          return formatRows(rows, args.type || "entities");
+        } catch (e) {
+          log("ERROR", "memory_list failed", { error: e.message });
+          return `Error: ${e.message || String(e)}`;
+        }
       },
     }),
 
@@ -200,7 +228,11 @@ const plugin = async () => ({
       async execute(args, _ctx) {
         try {
           const r = getDb().prepare("SELECT * FROM entities WHERE id = ?").get(args.entityId);
-          if (!r) return "Entity not found.";
+          if (!r) {
+            log("DEBUG", "get not found", { entityId: args.entityId });
+            return "Entity not found.";
+          }
+          log("DEBUG", "get found", { entityId: args.entityId.slice(0, 8), type: r.type });
           return [
             `ID:   ${r.id}`, `Type: ${r.type}`, `Name: ${r.name || "(none)"}`,
             `Text: ${r.text}`, `Cat:  ${r.category}`, `Scope: ${r.scope}`,
@@ -208,7 +240,10 @@ const plugin = async () => ({
             `Data: ${JSON.stringify(jsonCol(r.data), null, 2)}`,
             `Src:  ${r.source}`, `Created: ${r.created_at}`, `Updated: ${r.updated_at}`,
           ].join("\n");
-        } catch (e) { return `Error: ${e.message || String(e)}`; }
+        } catch (e) {
+          log("ERROR", "memory_get failed", { error: e.message, entityId: args.entityId });
+          return `Error: ${e.message || String(e)}`;
+        }
       },
     }),
 
@@ -234,11 +269,18 @@ const plugin = async () => ({
           if (args.scope !== undefined) { sets.push("scope = ?"); p.push(args.scope); }
           if (args.tags !== undefined) { sets.push("tags = ?"); p.push(JSON.stringify(args.tags)); }
           if (args.data !== undefined) { sets.push("data = ?"); p.push(JSON.stringify(args.data)); }
-          if (!sets.length) return "No fields to update.";
+          if (!sets.length) {
+            log("WARN", "update with no fields", { entityId: args.entityId });
+            return "No fields to update.";
+          }
           sets.push("updated_at = ?"); p.push(now()); p.push(args.entityId);
           const info = d.prepare(`UPDATE entities SET ${sets.join(", ")} WHERE id = ?`).run(...p);
+          log("INFO", `update ${info.changes > 0 ? "changed" : "not found"}`, { entityId: args.entityId.slice(0, 8), fields: sets.length - 1 });
           return info.changes > 0 ? "Updated." : "Not found.";
-        } catch (e) { return `Error: ${e.message || String(e)}`; }
+        } catch (e) {
+          log("ERROR", "memory_update failed", { error: e.message, entityId: args.entityId });
+          return `Error: ${e.message || String(e)}`;
+        }
       },
     }),
 
@@ -259,8 +301,13 @@ const plugin = async () => ({
           if (args.query) { const l = `%${args.query}%`; sql.push("AND (name LIKE ? OR text LIKE ?)"); p.push(l, l); }
           if (args.scope) { sql.push("AND scope = ?"); p.push(args.scope); }
           if (args.type) { sql.push("AND type = ?"); p.push(args.type); }
-          return `Deleted ${d.prepare(sql.join(" ")).run(...p).changes}.`;
-        } catch (e) { return `Error: ${e.message || String(e)}`; }
+          const n = d.prepare(sql.join(" ")).run(...p).changes;
+          log("INFO", `forget deleted ${n}`, { entityId: args.entityId, query: args.query, scope: args.scope });
+          return `Deleted ${n}.`;
+        } catch (e) {
+          log("ERROR", "memory_forget failed", { error: e.message });
+          return `Error: ${e.message || String(e)}`;
+        }
       },
     }),
 
@@ -275,6 +322,7 @@ const plugin = async () => ({
           const byCat = d.prepare("SELECT category, COUNT(*) as c FROM entities GROUP BY category ORDER BY category").all();
           const byScope = d.prepare("SELECT scope, COUNT(*) as c FROM entities GROUP BY scope ORDER BY scope").all();
           const range = d.prepare("SELECT MIN(created_at) as oldest, MAX(updated_at) as newest FROM entities").get();
+          log("INFO", "stats", { total, types: byType.length });
           return [
             "Memory Statistics", "=".repeat(17), `Total: ${total}\n`,
             "By type:", ...byType.map(r => `  ${r.type}: ${r.c}`),
@@ -282,7 +330,10 @@ const plugin = async () => ({
             "\nBy scope:", ...byScope.map(r => `  ${r.scope}: ${r.c}`),
             `\nRange: ${range?.oldest || "N/A"} to ${range?.newest || "N/A"}`,
           ].join("\n");
-        } catch (e) { return `Error: ${e.message || String(e)}`; }
+        } catch (e) {
+          log("ERROR", "memory_stats failed", { error: e.message });
+          return `Error: ${e.message || String(e)}`;
+        }
       },
     }),
 
