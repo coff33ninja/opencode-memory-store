@@ -1,0 +1,12 @@
+{
+  "name": "opencode-memory-store",
+  "version": "0.1.0",
+  "description": "Async SQL memory store plugin for OpenCode",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": {
+      "import": "./index.js"
+    }
+  }
+}
