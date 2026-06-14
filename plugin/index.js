@@ -1,6 +1,6 @@
 import { tool } from "@opencode-ai/plugin/tool";
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -114,6 +114,13 @@ function formatRows(rows, label) {
     lines.push(`   Scope: ${r.scope} | Cat: ${r.category} | Imp: ${r.importance}`);
     const tags = jsonCol(r.tags);
     if (tags.length) lines.push(`   Tags: ${tags.join(", ")}`);
+    try {
+      const data = typeof r.data === "string" ? JSON.parse(r.data) : (r.data || {});
+      if (data.path) {
+        const exists = existsSync(data.path);
+        lines.push(`   Path: ${data.path}${exists ? "" : " ⚠ PATH DOES NOT EXIST"}`);
+      }
+    } catch (_) {}
     lines.push("");
   });
   return lines.join("\n");

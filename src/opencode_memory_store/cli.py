@@ -5,7 +5,7 @@ from .store import MemoryStore, get_db_path
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["store", "get", "recall", "list", "update", "forget", "stats", "ingest", "import"])
+    parser.add_argument("command", choices=["store", "get", "recall", "list", "update", "forget", "stats", "ingest", "import", "verify-paths"])
     parser.add_argument("text", nargs="?", default="")
     parser.add_argument("--db-dir")
     parser.add_argument("--type", default=None)
@@ -71,6 +71,10 @@ def main():
             print(f"   Scope: {r['scope']} | Cat: {r['category']} | Imp: {r['importance']}")
             if r['tags']:
                 print(f"   Tags: {', '.join(r['tags'])}")
+            p = r.get("data", {}).get("path", "") if isinstance(r.get("data"), dict) else ""
+            if p:
+                exists = os.path.isdir(p) or os.path.isfile(p)
+                print(f"   Path: {p}{'  ⚠ NOT FOUND' if not exists else ''}")
             print()
 
     elif args.command == "list":
@@ -120,10 +124,46 @@ def main():
             print(f"  {k}: {v}")
         print(f"\nRange: {s['oldest_timestamp'] or 'N/A'} to {s['newest_timestamp'] or 'N/A'}")
 
+    elif args.command == "verify-paths":
+        verify_paths(store)
     elif args.command == "ingest":
         ingest_project(store, args)
     elif args.command == "import":
         import_json(store, args)
+
+
+def verify_paths(store):
+    all_entities = store.list_entities(limit=9999)
+    total = 0
+    stale = 0
+    fixed = 0
+    for e in all_entities:
+        data = e.get("data", {})
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                continue
+        p = data.get("path", "") if isinstance(data, dict) else ""
+        if not p:
+            continue
+        total += 1
+        resolved = Path(p).resolve()
+        if resolved.is_dir() or resolved.is_file():
+            continue
+        stale += 1
+        print(f"  ⚠ Stale path: {e['name']} ({e['type']}) -> {p}")
+        for candidate in [Path.cwd(), Path.cwd().parent, Path.home()]:
+            rel = Path(p)
+            if rel.is_absolute():
+                continue
+            guess = candidate / rel
+            if guess.exists():
+                store.update(e["id"], data={**data, "path": str(guess.resolve())})
+                print(f"    → Updated to: {guess.resolve()}")
+                fixed += 1
+                break
+    print(f"\nPaths checked: {total}, stale: {stale}, auto-fixed: {fixed}")
 
 
 def import_json(store, args):

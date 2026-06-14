@@ -3,7 +3,7 @@ Validate the memory store works correctly across scopes, types, and queries.
 Uses an isolated temp DB so it won't touch real data.
 """
 
-import os, sys, json, tempfile, shutil
+import os, sys, json, tempfile, shutil, subprocess
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
@@ -115,6 +115,28 @@ def forget_test(store):
     n = store.forget(type="note")
     ok("forget by type returns 0 (already deleted)") if n == 0 else fail("forget type after id", f"got {n}")
 
+def path_tracking_test(store):
+    print("\n=== Path tracking ===")
+    real_dir = Path(tempfile.mkdtemp(prefix="path_test_"))
+    real_file = real_dir / "README.md"
+    real_file.write_text("# Test Project")
+    store.store(type="project", name="test-proj", text="A test project",
+                scope="project:test-proj", importance=0.9,
+                data={"path": str(real_file.parent)})
+    store.store(type="project", name="ghost-proj", text="A ghost project",
+                scope="project:ghost", importance=0.9,
+                data={"path": str(real_dir / "nonexistent" / "subdir")})
+    r = store.recall(scope="project:test-proj")
+    ok("recall with path returns entity") if len(r) >= 1 else fail("path recall entity")
+    data = r[0].get("data", {})
+    if isinstance(data, str):
+        try: data = json.loads(data)
+        except: data = {}
+    p = data.get("path", "") if isinstance(data, dict) else ""
+    ok("data.path stored correctly") if "path_test_" in str(p) else fail("data.path", f"got {p}")
+    shutil.rmtree(str(real_dir), ignore_errors=True)
+
+
 def stats_test(store):
     print("\n=== Stats ===")
     s = store.stats()
@@ -137,6 +159,7 @@ if __name__ == "__main__":
     importance_filter_test(store)
     update_test(store)
     forget_test(store)
+    path_tracking_test(store)
     stats_test(store)
 
     shutil.rmtree(tmpdir, ignore_errors=True)
