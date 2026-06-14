@@ -137,7 +137,7 @@ const plugin = async () => ({
         tags: tool.schema.array(tool.schema.string()).optional().describe("Tags array"),
         data: tool.schema.object({}).optional().describe("Structured data as JSON object"),
       },
-      execute(args) {
+      async execute(args, _ctx) {
         try {
           const d = getDb();
           const id = randomUUID();
@@ -163,7 +163,7 @@ const plugin = async () => ({
         category: tool.schema.string().optional().describe("Filter by category"),
         limit: tool.schema.number().min(1).max(100).optional().describe("Max results, default 10"),
       },
-      execute(args) { try { return formatRows(buildRecall(args)); } catch (e) { return `Error: ${e.message || String(e)}`; } },
+      async execute(args, _ctx) { try { return formatRows(buildRecall(args)); } catch (e) { return `Error: ${e.message || String(e)}`; } },
     }),
 
     memory_list: tool({
@@ -174,7 +174,7 @@ const plugin = async () => ({
         category: tool.schema.string().optional().describe("Filter by category"),
         limit: tool.schema.number().min(1).max(100).optional().describe("Max results, default 50"),
       },
-      execute(args) {
+      async execute(args, _ctx) {
         try {
           const d = getDb();
           const sql = ["SELECT id,type,name,text,scope,category,importance FROM entities WHERE 1=1"];
@@ -191,9 +191,9 @@ const plugin = async () => ({
     memory_get: tool({
       description: "Get a single entity by ID with full details.",
       args: { entityId: tool.schema.string().describe("Entity ID") },
-      execute({ entityId }) {
+      async execute(args, _ctx) {
         try {
-          const r = getDb().prepare("SELECT * FROM entities WHERE id = ?").get(entityId);
+          const r = getDb().prepare("SELECT * FROM entities WHERE id = ?").get(args.entityId);
           if (!r) return "Entity not found.";
           return [
             `ID:   ${r.id}`, `Type: ${r.type}`, `Name: ${r.name || "(none)"}`,
@@ -218,7 +218,7 @@ const plugin = async () => ({
         tags: tool.schema.array(tool.schema.string()).optional(),
         data: tool.schema.object({}).optional(),
       },
-      execute(args) {
+      async execute(args, _ctx) {
         try {
           const d = getDb(); const sets = []; const p = [];
           if (args.name !== undefined) { sets.push("name = ?"); p.push(args.name); }
@@ -244,7 +244,7 @@ const plugin = async () => ({
         scope: tool.schema.string().optional().describe("Delete all in this scope"),
         type: ENTITY_TYPES_OPT,
       },
-      execute(args) {
+      async execute(args, _ctx) {
         try {
           if (!args.entityId && !args.query && !args.scope && !args.type)
             return "Error: provide at least one filter (entityId, query, scope, or type)";
@@ -261,7 +261,7 @@ const plugin = async () => ({
     memory_stats: tool({
       description: "Get memory store statistics by type/category/scope.",
       args: {},
-      execute() {
+      async execute(_args, _ctx) {
         try {
           const d = getDb();
           const total = d.prepare("SELECT COUNT(*) as c FROM entities").get().c;
@@ -283,7 +283,7 @@ const plugin = async () => ({
     memory_debug: tool({
       description: "Verify the plugin is loaded and connected to SQLite.",
       args: {},
-      execute() {
+      async execute(_args, _ctx) {
         try {
           return `opencode-memory-store plugin OK — ${getDb().prepare("SELECT COUNT(*) as c FROM entities").get().c} entities in SQLite`;
         } catch (e) { return `Error: ${e.message || String(e)}`; }
